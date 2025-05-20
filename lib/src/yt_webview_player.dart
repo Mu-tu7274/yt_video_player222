@@ -1,7 +1,67 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:encrypt/encrypt.dart' as encrypt;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+/// Singleton secure storage with dynamic AES key/IV
+class SecureStorage {
+  SecureStorage._();
+  static final SecureStorage _instance = SecureStorage._();
+  factory SecureStorage() => _instance;
+
+  final _storage = const FlutterSecureStorage();
+  late encrypt.Key encryptionKey;
+  late encrypt.IV iv;
+
+  Future<void> init() async {
+    await _loadKey();
+    await _loadIV();
+  }
+
+  Future<void> _loadKey() async {
+    String? keyBase64 = await _storage.read(key: 'encryptionKey');
+    if (keyBase64 == null) {
+      keyBase64 = encrypt.Key.fromLength(32).base64;
+      await _storage.write(key: 'encryptionKey', value: keyBase64);
+    }
+    encryptionKey = encrypt.Key.fromBase64(keyBase64);
+  }
+
+  Future<void> _loadIV() async {
+    String? ivBase64 = await _storage.read(key: 'encryptionIV');
+    if (ivBase64 == null) {
+      ivBase64 = encrypt.IV.fromLength(16).base64;
+      await _storage.write(key: 'encryptionIV', value: ivBase64);
+    }
+    iv = encrypt.IV.fromBase64(ivBase64);
+  }
+
+  String encryptData(String data) {
+    final encrypter = encrypt.Encrypter(encrypt.AES(encryptionKey));
+    return encrypter.encrypt(data, iv: iv).base64;
+  }
+
+  String decryptData(String encryptedData) {
+    final encrypter = encrypt.Encrypter(encrypt.AES(encryptionKey));
+    return encrypter.decrypt64(encryptedData, iv: iv);
+  }
+
+  Future<String> getOrCreateEncrypted(String key, String plainText) async {
+    String? stored = await _storage.read(key: key);
+    if (stored == null) {
+      stored = encryptData(plainText);
+      await _storage.write(key: key, value: stored);
+    }
+    return stored;
+  }
+
+  Future<String> decryptStored(String key) async {
+    final encrypted = await _storage.read(key: key);
+    if (encrypted == null) throw Exception("Missing encrypted key: $key");
+    return decryptData(encrypted);
+  }
+}
 
 class YTWebViewPlayer extends StatefulWidget {
   final String videoId;
@@ -15,12 +75,40 @@ class _YTWebViewPlayerState extends State<YTWebViewPlayer> {
   InAppWebViewController? _webViewController;
   bool hasError = false;
   bool showShadows = false;
-  Timer? _shadowHideTimer;
+  final SecureStorage _secureStorage = SecureStorage();
+  String? fullUrl;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initialize());
     _forceLandscapeMode();
+  }
+
+  Future<void> _initialize() async {
+    try {
+      await _secureStorage.init();
+
+      // LICENSE check
+      final encryptedLicense = await _secureStorage.getOrCreateEncrypted('license_key', 'LICENSE-KEY-1234');
+      final license = _secureStorage.decryptData(encryptedLicense);
+      if (license != 'LICENSE-KEY-1234') throw Exception("License mismatch");
+
+      // Encrypted YouTube parts
+      final ytPrefix = await _secureStorage.getOrCreateEncrypted('yt_prefix', 'https://www.youtube.com/embed/');
+      final ytSuffix = await _secureStorage.getOrCreateEncrypted(
+        'yt_suffix',
+        '?autoplay=1&controls=0&modestbranding=1&rel=0&iv_load_policy=3&disablekb=1&fs=0&playsinline=1&enablejsapi=1',
+      );
+
+      final url = _secureStorage.decryptData(ytPrefix) + widget.videoId + _secureStorage.decryptData(ytSuffix);
+      setState(() {
+        fullUrl = url;
+      });
+    } catch (e) {
+      print("❌ Initialization error: $e");
+      setState(() => hasError = true);
+    }
   }
 
   void _forceLandscapeMode() {
@@ -36,36 +124,23 @@ class _YTWebViewPlayerState extends State<YTWebViewPlayer> {
       DeviceOrientation.portraitUp,
       DeviceOrientation.portraitDown,
     ]);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
-        overlays: SystemUiOverlay.values);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: SystemUiOverlay.values);
     Navigator.pop(context);
   }
 
   Future<void> _injectJavaScript() async {
     try {
-      String jsCode = await rootBundle.loadString('assets/rawplayer.js');
+      final jsCode = await rootBundle.loadString('assets/rawplayer.js');
       await _webViewController?.evaluateJavascript(source: jsCode);
     } catch (e) {
-      debugPrint("❌ Error loading JavaScript from assets: $e");
+      print("❌ JS injection failed: $e");
     }
-  }
-
-  void _startShadowHideTimer() {
-    setState(() {
-      showShadows = true;
-    });
-
-    _shadowHideTimer?.cancel();
-    _shadowHideTimer = Timer(const Duration(seconds: 3), () {
-      setState(() {
-        showShadows = false;
-      });
-    });
   }
 
   @override
   Widget build(BuildContext context) {
     final screenHeight = MediaQuery.of(context).size.height;
+
     return WillPopScope(
       onWillPop: () async {
         _restorePortraitMode();
@@ -73,177 +148,25 @@ class _YTWebViewPlayerState extends State<YTWebViewPlayer> {
       },
       child: Scaffold(
         backgroundColor: Colors.black,
-        body: Stack(
-          children: [
-            hasError
-                ? Center(
-                child: Text("Error loading video",
-                    style: TextStyle(color: Colors.white)))
-                : InAppWebView(
-              initialUrlRequest: URLRequest(
-                url: WebUri(
-                    "https://www.youtube.com/embed/${widget.videoId}?autoplay=1&controls=0&modestbranding=1&rel=0&iv_load_policy=3&disablekb=1&fs=0&playsinline=1&enablejsapi=1"),
-              ),
-              initialSettings: InAppWebViewSettings(
-                transparentBackground: true,
-                mediaPlaybackRequiresUserGesture: false,
-                allowsInlineMediaPlayback: true,
-                javaScriptEnabled: true,
-                userAgent: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-
-              ),
-              onWebViewCreated: (controller)async {
-                _webViewController = controller;
-                await _injectJavaScript();
-                _startShadowHideTimer();
-              },
-              onLoadStop: (controller, url) async {
-                await _injectJavaScript();
-                showShadows = true ;
-                // JavaScript code to interact with the video player
-                String script = """ (function () {
-  // Retrieve the video player element by ID
-  var player = document.getElementById('movie_player');
-
-  if (player && typeof YT !== 'undefined') {
-    // Notify Flutter on player state changes
-    player.addEventListener('onStateChange', function (event) {
-      if (event.data == YT.PlayerState.PLAYING) {
-        window.flutter_inappwebview.callHandler('VideoStateChange', 'playing');
-        disableFullScreen();
-        hideElements();
-      } else if (event.data == YT.PlayerState.PAUSED) {
-        window.flutter_inappwebview.callHandler('VideoStateChange', 'paused');
-      }
-    });
-  }
-
-  // Check if the video player exists and is ready
-  if (!player || typeof player.getCurrentTime !== 'function' || typeof player.getDuration !== 'function') {
-    return { error: 'Video player is not ready or missing methods' };
-  }
-
-  // Set playback quality
-  player.setPlaybackQualityRange('medium');
-
-  // Disable fullscreen functionality
-  function disableFullScreen() {
-    var requestFullScreen = player.requestFullscreen || player.mozRequestFullScreen || player.webkitRequestFullScreen;
-    if (requestFullScreen) {
-      requestFullScreen = function () {};
-    }
-  }
-
-  // Listen for fullscreen changes
-  document.addEventListener('fullscreenchange', function (e) {
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    }
-  });
-
-  // Hide YouTube overlays and watermark
-  function hideElements() {
-    const selectors = [
-      '.ytp-chrome-top',
-      '.ytp-pause-overlay',
-      ':not(.ytp-mweb-player) .ytp-watermark'
-    ];
-    selectors.forEach(selector => {
-      document.querySelectorAll(selector).forEach(el => {
-        el.style.display = 'none';
-      });
-    });
-  }
-
-  // Call immediately and with delay to catch async re-renders
-  hideElements();
-  setTimeout(hideElements, 300);
-  setTimeout(hideElements, 600);
-  setTimeout(hideElements, 1000);
-
-  // Return success
-  return { success: 'Video player setup complete' };
-})();
-  """;
-
-                try {
-                  // Evaluating the JavaScript code to set up the video player
-                  var result = await _webViewController
-                      ?.evaluateJavascript(source: script);
-
-                  // Check if any error occurred during JavaScript execution
-                  if (result != null) {
-                    try {
-                      Map<String, dynamic> parsedResult =
-                      Map<String, dynamic>.from(result);
-
-                      // Handle errors returned from JavaScript
-                      if (parsedResult.containsKey('error')) {
-
-                        return;
-                      } else {
-
-                      }
-                    } catch (e) {
-                      print("Failed to parse JavaScript result: \$e");
-
-                    }
-                  } else {
-                    print(
-                        "JavaScript evaluation returned null or empty result.");
-                  }
-
-                  // Fetch the total duration of the video
-                  String durationScript = """
-    (function() {
-      var player = document.getElementById('movie_player');
-      return player && player.getDuration ? player.getDuration() : 0;
-    })();
-    """;
-
-                  var durationResult = await _webViewController
-                      ?.evaluateJavascript(source: durationScript);
-                  double duration =
-                      double.tryParse(durationResult.toString()) ?? 0.0;
-
-
-                  // Hide shadows periodically
-                  Timer.periodic(const Duration(seconds: 3), (timer) {
-                  });
-                } catch (e) {
-                  print("Error during onLoadStop: \$e");
-                }
-              },
-            ),
-            if (showShadows)
-              Positioned(
-                top: 0,
-                left: 0,
-                right: 0,
-                child: Container(
-                  height: screenHeight * 0.155,
-                  color: Colors.black,
-                ),
-              ),
-            if (showShadows)
-              Positioned(
-                bottom: 0,
-                left: 0,
-                right: 0,
-                child: Container(
-                  height: screenHeight * 0.13,
-                  color: Colors.black,
-                ),
-              ),
-            Positioned(
-              top: 16,
-              right: 16,
-              child: IconButton(
-                icon: Icon(Icons.close, color: Colors.white, size: 30),
-                onPressed: _restorePortraitMode,
-              ),
-            ),
-          ],
+        body: hasError
+            ? const Center(
+            child: Text("⛔ Invalid license or error", style: TextStyle(color: Colors.white)))
+            : fullUrl == null
+            ? const Center(child: CircularProgressIndicator())
+            : InAppWebView(
+          initialUrlRequest: URLRequest(url: WebUri(fullUrl!)),
+          initialSettings: InAppWebViewSettings(
+            transparentBackground: true,
+            mediaPlaybackRequiresUserGesture: false,
+            allowsInlineMediaPlayback: true,
+            javaScriptEnabled: true,
+            userAgent:
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+          ),
+          onWebViewCreated: (controller) {
+            _webViewController = controller;
+            _injectJavaScript();
+          },
         ),
       ),
     );
